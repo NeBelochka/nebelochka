@@ -133,6 +133,43 @@ def on_my_chat_member(upd: types.ChatMemberUpdated):
         log.info("Dropped channel %s (%s) — status=%s", chat.title, chat.id, new_status)
 
 
+@bot.channel_post_handler(
+    content_types=[
+        "text",
+        "photo",
+        "video",
+        "document",
+        "audio",
+        "animation",
+        "voice",
+        "video_note",
+        "sticker",
+        "poll",
+    ]
+)
+def on_channel_post(message):
+    # Telegram only delivers channel_post updates for channels where the bot is admin
+    # (and admin lacks the "messages" privacy filter). Use this to catch up on channels
+    # we were already admin in before the bot started running.
+    chat = message.chat
+    if chat.type != "channel":
+        return
+    existing = {c["chat_id"] for c in list_channels()}
+    if chat.id not in existing:
+        upsert_channel(chat.id, chat.title or "", chat.username or "")
+        log.info("Auto-registered channel %s (%s) from channel_post", chat.title, chat.id)
+
+
+def _forwarded_chat(message):
+    chat = getattr(message, "forward_from_chat", None)
+    if chat is not None:
+        return chat
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        return getattr(origin, "chat", None)
+    return None
+
+
 @bot.message_handler(commands=["start", "help"])
 @authorized
 def cmd_start(message):
@@ -164,7 +201,13 @@ def cmd_channels(message):
     if not chans:
         bot.send_message(
             message.chat.id,
-            "Пока нет каналов. Добавьте меня админом или используйте /add @username.",
+            "Пока нет каналов.\n\n"
+            "Telegram присылает событие «бот стал админом» только в момент изменения "
+            "статуса. Если я уже был админом до запуска — событие не придёт. Варианты:\n"
+            "• опубликуйте любое сообщение в канал — я зарегистрирую его автоматически;\n"
+            "• перешлите любой пост из канала мне в личку;\n"
+            "• используйте /add @username канала;\n"
+            "• передобавьте меня в админы (снять и снова назначить).",
         )
         return
     lines = [f"• {c['title'] or c['chat_id']} ({c['chat_id']})" for c in chans]
@@ -237,7 +280,8 @@ def cmd_new(message):
     if not chans:
         bot.send_message(
             message.chat.id,
-            "Нет каналов. Сначала добавьте меня админом или используйте /add @username.",
+            "Нет каналов. Посмотрите /channels — там подсказка, как зарегистрировать "
+            "канал, в котором я уже админ.",
         )
         return
     bot.set_state(message.from_user.id, PostStates.choosing_channels, message.chat.id)
@@ -491,6 +535,35 @@ def send_post(chat_id, text, buttons):
         log.info("Posted to %s", chat_id)
     except Exception as e:
         log.exception("Failed to post to %s: %s", chat_id, e)
+
+
+@bot.message_handler(
+    func=lambda m: _forwarded_chat(m) is not None,
+    content_types=[
+        "text",
+        "photo",
+        "video",
+        "document",
+        "audio",
+        "animation",
+        "voice",
+    ],
+)
+@authorized
+def on_forward(message):
+    chat = _forwarded_chat(message)
+    if chat is None or chat.type != "channel":
+        return
+    try:
+        me = bot.get_chat_member(chat.id, bot.get_me().id)
+    except Exception as e:
+        bot.reply_to(message, f"Не могу проверить мой статус в «{chat.title}»: {e}")
+        return
+    if me.status in ("administrator", "creator"):
+        upsert_channel(chat.id, chat.title or "", chat.username or "")
+        bot.reply_to(message, f"Канал «{chat.title}» добавлен.")
+    else:
+        bot.reply_to(message, f"Я не админ в «{chat.title}».")
 
 
 def main():
