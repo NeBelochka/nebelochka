@@ -8,10 +8,24 @@ import telebot
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
-from telebot import types, util
+from telebot import types
 from telebot.custom_filters import StateFilter
 from telebot.handler_backends import State, StatesGroup
 from telebot.storage import StateMemoryStorage
+
+# Explicit list — do not rely on telebot.util.update_types, since its contents
+# vary between library versions. If "my_chat_member" is missing from the list
+# passed to getUpdates, we silently lose every "bot was added as admin" event,
+# which is the main way channels get registered.
+ALLOWED_UPDATES = [
+    "message",
+    "edited_message",
+    "channel_post",
+    "edited_channel_post",
+    "callback_query",
+    "my_chat_member",
+    "chat_member",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +45,11 @@ DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "notifier.db")
 JOBS_DB = os.path.join(DATA_DIR, "jobs.db")
+
+# Comma/space-separated list of channel @usernames or numeric IDs (e.g. -100123…)
+# Used to seed the channel list on startup so registrations survive a DB wipe
+# (ephemeral filesystems on Render/Heroku/etc).
+BOOTSTRAP_CHANNELS = os.getenv("BOOTSTRAP_CHANNELS", "")
 
 state_storage = StateMemoryStorage()
 bot = telebot.TeleBot(BOT_TOKEN, state_storage=state_storage)
@@ -133,6 +152,43 @@ def on_my_chat_member(upd: types.ChatMemberUpdated):
         log.info("Dropped channel %s (%s) — status=%s", chat.title, chat.id, new_status)
 
 
+@bot.channel_post_handler(
+    content_types=[
+        "text",
+        "photo",
+        "video",
+        "document",
+        "audio",
+        "animation",
+        "voice",
+        "video_note",
+        "sticker",
+        "poll",
+    ]
+)
+def on_channel_post(message):
+    # Telegram only delivers channel_post updates for channels where the bot is admin
+    # (and admin lacks the "messages" privacy filter). Use this to catch up on channels
+    # we were already admin in before the bot started running.
+    chat = message.chat
+    if chat.type != "channel":
+        return
+    existing = {c["chat_id"] for c in list_channels()}
+    if chat.id not in existing:
+        upsert_channel(chat.id, chat.title or "", chat.username or "")
+        log.info("Auto-registered channel %s (%s) from channel_post", chat.title, chat.id)
+
+
+def _forwarded_chat(message):
+    chat = getattr(message, "forward_from_chat", None)
+    if chat is not None:
+        return chat
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        return getattr(origin, "chat", None)
+    return None
+
+
 @bot.message_handler(commands=["start", "help"])
 @authorized
 def cmd_start(message):
@@ -143,6 +199,7 @@ def cmd_start(message):
         "/new — создать пост\n"
         "/channels — список каналов, где я админ\n"
         "/add @username — добавить канал вручную\n"
+        "/discover — перечитать BOOTSTRAP_CHANNELS из env\n"
         "/jobs — запланированные посты\n"
         "/cancel_job <id> — отменить запланированный пост\n"
         "/cancel — сбросить текущий диалог\n\n"
@@ -164,7 +221,16 @@ def cmd_channels(message):
     if not chans:
         bot.send_message(
             message.chat.id,
-            "Пока нет каналов. Добавьте меня админом или используйте /add @username.",
+            "Пока нет каналов.\n\n"
+            "Telegram присылает событие «бот стал админом» только в момент изменения "
+            "статуса. Если я уже был админом до запуска (или БД сбросилась после "
+            "рестарта на эфемерном диске) — событие не придёт. Варианты:\n"
+            "• задайте env-переменную BOOTSTRAP_CHANNELS=@ch1,@ch2,-1001234… и "
+            "вызовите /discover — каналы восстановятся при каждом старте;\n"
+            "• опубликуйте любое сообщение в канал — я зарегистрирую его автоматически;\n"
+            "• перешлите любой пост из канала мне в личку;\n"
+            "• используйте /add @username канала;\n"
+            "• передобавьте меня в админы (снять и снова назначить).",
         )
         return
     lines = [f"• {c['title'] or c['chat_id']} ({c['chat_id']})" for c in chans]
@@ -237,7 +303,8 @@ def cmd_new(message):
     if not chans:
         bot.send_message(
             message.chat.id,
-            "Нет каналов. Сначала добавьте меня админом или используйте /add @username.",
+            "Нет каналов. Посмотрите /channels — там подсказка, как зарегистрировать "
+            "канал, в котором я уже админ.",
         )
         return
     bot.set_state(message.from_user.id, PostStates.choosing_channels, message.chat.id)
@@ -493,15 +560,114 @@ def send_post(chat_id, text, buttons):
         log.exception("Failed to post to %s: %s", chat_id, e)
 
 
+@bot.message_handler(
+    func=lambda m: _forwarded_chat(m) is not None,
+    content_types=[
+        "text",
+        "photo",
+        "video",
+        "document",
+        "audio",
+        "animation",
+        "voice",
+    ],
+)
+@authorized
+def on_forward(message):
+    chat = _forwarded_chat(message)
+    if chat is None or chat.type != "channel":
+        return
+    try:
+        me = bot.get_chat_member(chat.id, bot.get_me().id)
+    except Exception as e:
+        bot.reply_to(message, f"Не могу проверить мой статус в «{chat.title}»: {e}")
+        return
+    if me.status in ("administrator", "creator"):
+        upsert_channel(chat.id, chat.title or "", chat.username or "")
+        bot.reply_to(message, f"Канал «{chat.title}» добавлен.")
+    else:
+        bot.reply_to(message, f"Я не админ в «{chat.title}».")
+
+
+def _split_idents(raw):
+    out = []
+    for part in raw.replace(",", " ").split():
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            out.append(part)
+    return out
+
+
+def bootstrap_channels():
+    idents = _split_idents(BOOTSTRAP_CHANNELS)
+    if not idents:
+        return
+    try:
+        me_id = bot.get_me().id
+    except Exception as e:
+        log.error("Bootstrap: cannot fetch bot identity: %s", e)
+        return
+    for ident in idents:
+        try:
+            chat = bot.get_chat(ident)
+            me = bot.get_chat_member(chat.id, me_id)
+        except Exception as e:
+            log.warning("Bootstrap: skip %s — %s", ident, e)
+            continue
+        if me.status in ("administrator", "creator"):
+            upsert_channel(chat.id, chat.title or "", chat.username or "")
+            log.info("Bootstrap: registered %s (%s)", chat.title, chat.id)
+        else:
+            log.warning(
+                "Bootstrap: %s — not an admin (status=%s); skipping",
+                chat.title or ident,
+                me.status,
+            )
+
+
+@bot.message_handler(commands=["discover"])
+@authorized
+def cmd_discover(message):
+    if not BOOTSTRAP_CHANNELS:
+        bot.reply_to(
+            message,
+            "Переменная BOOTSTRAP_CHANNELS не задана. Установите её "
+            "(через запятую: @channel1, @channel2, -100123…) и перезапустите бота "
+            "или вызовите /discover ещё раз.",
+        )
+        return
+    before = {c["chat_id"] for c in list_channels()}
+    bootstrap_channels()
+    after = list_channels()
+    added = [c for c in after if c["chat_id"] not in before]
+    if added:
+        lines = [f"• {c['title'] or c['chat_id']} ({c['chat_id']})" for c in added]
+        bot.reply_to(message, "Добавлено:\n" + "\n".join(lines))
+    else:
+        bot.reply_to(message, f"Всего каналов: {len(after)}. Новых не добавилось.")
+
+
 def main():
     init_db()
     bot.add_custom_filter(StateFilter(bot))
     scheduler.start()
-    log.info("Bot is starting (tz=%s, owner=%s)", TIMEZONE, OWNER_ID)
+    log.info(
+        "Bot starting (tz=%s, owner=%s, data_dir=%s, bootstrap=%r)",
+        TIMEZONE,
+        OWNER_ID,
+        os.path.abspath(DATA_DIR),
+        BOOTSTRAP_CHANNELS,
+    )
+    bootstrap_channels()
+    log.info("Channels in DB at startup: %d", len(list_channels()))
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
-        allowed_updates=util.update_types,
+        allowed_updates=ALLOWED_UPDATES,
     )
 
 
