@@ -1,1 +1,1 @@
-worker: python currency_bot.py 
+worker: python notifier_bot.py
