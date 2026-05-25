@@ -2,3 +2,7 @@ pyTelegramBotAPI>=4.14.0
 APScheduler>=3.10.0
 SQLAlchemy>=2.0
 forex-python
+mss>=9.0
+Pillow>=10.0
+numpy>=1.24
+pynput>=1.7
